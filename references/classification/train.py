@@ -2,6 +2,7 @@ from __future__ import print_function
 import datetime
 import os
 import time
+import sys
 
 import torch
 import torch.utils.data
@@ -11,19 +12,31 @@ from torchvision import transforms
 
 import utils
 
+try:
+    from apex import amp
+except ImportError:
+    amp = None
 
-def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, print_freq):
+
+def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, print_freq, apex=False):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
+    metric_logger.add_meter('img/s', utils.SmoothedValue(window_size=10, fmt='{value}'))
+
     header = 'Epoch: [{}]'.format(epoch)
     for image, target in metric_logger.log_every(data_loader, print_freq, header):
         image, target = image.to(device), target.to(device)
         output = model(image)
         loss = criterion(output, target)
 
+        start_time = time.time()
         optimizer.zero_grad()
-        loss.backward()
+        if apex:
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            loss.backward()
         optimizer.step()
 
         acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
@@ -31,6 +44,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        metric_logger.meters['img/s'].update(batch_size / (time.time() - start_time))
 
 
 def evaluate(model, criterion, data_loader, device):
@@ -59,7 +73,25 @@ def evaluate(model, criterion, data_loader, device):
     return metric_logger.acc1.global_avg
 
 
+def _get_cache_path(filepath):
+    import hashlib
+    h = hashlib.sha1(filepath.encode()).hexdigest()
+    cache_path = os.path.join("~", ".torch", "vision", "datasets", "imagefolder", h[:10] + ".pt")
+    cache_path = os.path.expanduser(cache_path)
+    return cache_path
+
+
 def main(args):
+    if args.apex:
+        if sys.version_info < (3, 0):
+            raise RuntimeError("Apex currently only supports Python 3. Aborting.")
+        if amp is None:
+            raise RuntimeError("Failed to import apex. Please install apex from https://www.github.com/nvidia/apex "
+                               "to enable mixed-precision training.")
+
+    if args.output_dir:
+        utils.mkdir(args.output_dir)
+
     utils.init_distributed_mode(args)
     print(args)
 
@@ -76,28 +108,45 @@ def main(args):
 
     print("Loading training data")
     st = time.time()
-    scale = (0.08, 1.0)
-    if args.model == 'mobilenet_v2':
-        scale = (0.2, 1.0)
-    dataset = torchvision.datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=scale),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
+    cache_path = _get_cache_path(traindir)
+    if args.cache_dataset and os.path.exists(cache_path):
+        # Attention, as the transforms are also cached!
+        print("Loading dataset_train from {}".format(cache_path))
+        dataset, _ = torch.load(cache_path)
+    else:
+        dataset = torchvision.datasets.ImageFolder(
+            traindir,
+            transforms.Compose([
+                transforms.RandomResizedCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ]))
+        if args.cache_dataset:
+            print("Saving dataset_train to {}".format(cache_path))
+            utils.mkdir(os.path.dirname(cache_path))
+            utils.save_on_master((dataset, traindir), cache_path)
     print("Took", time.time() - st)
 
     print("Loading validation data")
-    dataset_test = torchvision.datasets.ImageFolder(
-        valdir,
-        transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]))
+    cache_path = _get_cache_path(valdir)
+    if args.cache_dataset and os.path.exists(cache_path):
+        # Attention, as the transforms are also cached!
+        print("Loading dataset_test from {}".format(cache_path))
+        dataset_test, _ = torch.load(cache_path)
+    else:
+        dataset_test = torchvision.datasets.ImageFolder(
+            valdir,
+            transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize,
+            ]))
+        if args.cache_dataset:
+            print("Saving dataset_test to {}".format(cache_path))
+            utils.mkdir(os.path.dirname(cache_path))
+            utils.save_on_master((dataset_test, valdir), cache_path)
 
     print("Creating data loaders")
     if args.distributed:
@@ -116,10 +165,10 @@ def main(args):
         sampler=test_sampler, num_workers=args.workers, pin_memory=True)
 
     print("Creating model")
-    model = torchvision.models.__dict__[args.model]()
+    model = torchvision.models.__dict__[args.model](pretrained=args.pretrained)
     model.to(device)
-    if args.distributed:
-        model = torch.nn.utils.convert_sync_batchnorm(model)
+    if args.distributed and args.sync_bn:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     model_without_ddp = model
     if args.distributed:
@@ -131,14 +180,19 @@ def main(args):
     optimizer = torch.optim.SGD(
         model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
-    # if using mobilenet, step_size=2 and gamma=0.94
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
+
+    if args.apex:
+        model, optimizer = amp.initialize(model, optimizer,
+                                          opt_level=args.apex_opt_level
+                                          )
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        args.start_epoch = checkpoint['epoch'] + 1
 
     if args.test_only:
         evaluate(model, criterion, data_loader_test, device=device)
@@ -146,26 +200,32 @@ def main(args):
 
     print("Start training")
     start_time = time.time()
-    for epoch in range(args.epochs):
+    for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
+        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args.print_freq, args.apex)
         lr_scheduler.step()
-        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args.print_freq)
         evaluate(model, criterion, data_loader_test, device=device)
         if args.output_dir:
-            utils.save_on_master({
+            checkpoint = {
                 'model': model_without_ddp.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
-                'args': args},
+                'epoch': epoch,
+                'args': args}
+            utils.save_on_master(
+                checkpoint,
                 os.path.join(args.output_dir, 'model_{}.pth'.format(epoch)))
+            utils.save_on_master(
+                checkpoint,
+                os.path.join(args.output_dir, 'checkpoint.pth'))
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
 
-if __name__ == "__main__":
+def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description='PyTorch Classification Training')
 
@@ -188,12 +248,41 @@ if __name__ == "__main__":
     parser.add_argument('--print-freq', default=10, type=int, help='print frequency')
     parser.add_argument('--output-dir', default='.', help='path where to save')
     parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+                        help='start epoch')
+    parser.add_argument(
+        "--cache-dataset",
+        dest="cache_dataset",
+        help="Cache the datasets for quicker initialization. It also serializes the transforms",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--sync-bn",
+        dest="sync_bn",
+        help="Use sync batch norm",
+        action="store_true",
+    )
     parser.add_argument(
         "--test-only",
         dest="test_only",
         help="Only test the model",
         action="store_true",
     )
+    parser.add_argument(
+        "--pretrained",
+        dest="pretrained",
+        help="Use pre-trained models from the modelzoo",
+        action="store_true",
+    )
+
+    # Mixed precision training parameters
+    parser.add_argument('--apex', action='store_true',
+                        help='Use apex for mixed precision training')
+    parser.add_argument('--apex-opt-level', default='O1', type=str,
+                        help='For apex mixed precision training'
+                             'O0 for FP32 training, O1 for mixed precision training.'
+                             'For further detail, see https://github.com/NVIDIA/apex/tree/master/examples/imagenet'
+                        )
 
     # distributed training parameters
     parser.add_argument('--world-size', default=1, type=int,
@@ -202,7 +291,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.output_dir:
-        utils.mkdir(args.output_dir)
+    return args
 
+
+if __name__ == "__main__":
+    args = parse_args()
     main(args)

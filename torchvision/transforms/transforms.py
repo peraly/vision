@@ -27,7 +27,8 @@ else:
 __all__ = ["Compose", "ToTensor", "ToPILImage", "Normalize", "Resize", "Scale", "CenterCrop", "Pad",
            "Lambda", "RandomApply", "RandomChoice", "RandomOrder", "RandomCrop", "RandomHorizontalFlip",
            "RandomVerticalFlip", "RandomResizedCrop", "RandomSizedCrop", "FiveCrop", "TenCrop", "LinearTransformation",
-           "ColorJitter", "RandomRotation", "RandomAffine", "Grayscale", "RandomGrayscale"]
+           "ColorJitter", "RandomRotation", "RandomAffine", "Grayscale", "RandomGrayscale",
+           "RandomPerspective"]
 
 _pil_interpolation_to_str = {
     Image.NEAREST: 'PIL.Image.NEAREST',
@@ -107,7 +108,7 @@ class ToPILImage(object):
              - If the input has 3 channels, the ``mode`` is assumed to be ``RGB``.
              - If the input has 2 channels, the ``mode`` is assumed to be ``LA``.
              - If the input has 1 channel, the ``mode`` is determined by the data type (i.e ``int``, ``float``,
-              ``short``).
+               ``short``).
 
     .. _PIL.Image mode: https://pillow.readthedocs.io/en/latest/handbook/concepts.html#concept-modes
     """
@@ -528,6 +529,70 @@ class RandomVerticalFlip(object):
         return self.__class__.__name__ + '(p={})'.format(self.p)
 
 
+class RandomPerspective(object):
+    """Performs Perspective transformation of the given PIL Image randomly with a given probability.
+
+    Args:
+        interpolation : Default- Image.BICUBIC
+
+        p (float): probability of the image being perspectively transformed. Default value is 0.5
+
+        distortion_scale(float): it controls the degree of distortion and ranges from 0 to 1. Default value is 0.5.
+
+    """
+
+    def __init__(self, distortion_scale=0.5, p=0.5, interpolation=Image.BICUBIC):
+        self.p = p
+        self.interpolation = interpolation
+        self.distortion_scale = distortion_scale
+
+    def __call__(self, img):
+        """
+        Args:
+            img (PIL Image): Image to be Perspectively transformed.
+
+        Returns:
+            PIL Image: Random perspectivley transformed image.
+        """
+        if not F._is_pil_image(img):
+            raise TypeError('img should be PIL Image. Got {}'.format(type(img)))
+
+        if random.random() < self.p:
+            width, height = img.size
+            startpoints, endpoints = self.get_params(width, height, self.distortion_scale)
+            return F.perspective(img, startpoints, endpoints, self.interpolation)
+        return img
+
+    @staticmethod
+    def get_params(width, height, distortion_scale):
+        """Get parameters for ``perspective`` for a random perspective transform.
+
+        Args:
+            width : width of the image.
+            height : height of the image.
+
+        Returns:
+            List containing [top-left, top-right, bottom-right, bottom-left] of the original image,
+            List containing [top-left, top-right, bottom-right, bottom-left] of the transformed image.
+        """
+        half_height = int(height / 2)
+        half_width = int(width / 2)
+        topleft = (random.randint(0, int(distortion_scale * half_width)),
+                   random.randint(0, int(distortion_scale * half_height)))
+        topright = (random.randint(width - int(distortion_scale * half_width) - 1, width - 1),
+                    random.randint(0, int(distortion_scale * half_height)))
+        botright = (random.randint(width - int(distortion_scale * half_width) - 1, width - 1),
+                    random.randint(height - int(distortion_scale * half_height) - 1, height - 1))
+        botleft = (random.randint(0, int(distortion_scale * half_width)),
+                   random.randint(height - int(distortion_scale * half_height) - 1, height - 1))
+        startpoints = [(0, 0), (width - 1, 0), (width - 1, height - 1), (0, height - 1)]
+        endpoints = [topleft, topright, botright, botleft]
+        return startpoints, endpoints
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(p={})'.format(self.p)
+
+
 class RandomResizedCrop(object):
     """Crop the given PIL Image to random size and aspect ratio.
 
@@ -680,7 +745,7 @@ class TenCrop(object):
         size (sequence or int): Desired output size of the crop. If size is an
             int instead of sequence like (h, w), a square crop (size, size) is
             made.
-        vertical_flip(bool): Use vertical flipping instead of horizontal
+        vertical_flip (bool): Use vertical flipping instead of horizontal
 
     Example:
          >>> transform = Compose([
@@ -717,10 +782,12 @@ class LinearTransformation(object):
     subtract mean_vector from it which is then followed by computing the dot
     product with the transformation matrix and then reshaping the tensor to its
     original shape.
+
     Applications:
-        - whitening transformation: Suppose X is a column vector zero-centered data.
-                 Then compute the data covariance matrix [D x D] with torch.mm(X.t(), X),
-                 perform SVD on this matrix and pass it as transformation_matrix.
+        whitening transformation: Suppose X is a column vector zero-centered data.
+        Then compute the data covariance matrix [D x D] with torch.mm(X.t(), X),
+        perform SVD on this matrix and pass it as transformation_matrix.
+
     Args:
         transformation_matrix (Tensor): tensor [D x D], D = C x H x W
         mean_vector (Tensor): tensor [D], D = C x H x W
@@ -909,6 +976,7 @@ class RandomRotation(object):
 
     def __call__(self, img):
         """
+        Args:
             img (PIL Image): Image to be rotated.
 
         Returns:
@@ -948,7 +1016,8 @@ class RandomAffine(object):
         resample ({PIL.Image.NEAREST, PIL.Image.BILINEAR, PIL.Image.BICUBIC}, optional):
             An optional resampling filter. See `filters`_ for more information.
             If omitted, or if the image has mode "1" or "P", it is set to PIL.Image.NEAREST.
-        fillcolor (int): Optional fill color for the area outside the transform in the output image. (Pillow>=5.0.0)
+        fillcolor (tuple or int): Optional fill color (Tuple for RGB Image And int for grayscale) for the area
+            outside the transform in the output image.(Pillow>=5.0.0)
 
     .. _filters: https://pillow.readthedocs.io/en/latest/handbook/concepts.html#filters
 

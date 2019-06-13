@@ -1,4 +1,5 @@
 import os
+import shutil
 from .vision import VisionDataset
 
 import numpy as np
@@ -53,7 +54,7 @@ class SBDataset(VisionDataset):
                  image_set='train',
                  mode='boundaries',
                  download=False,
-                 xy_transform=None, **kwargs):
+                 transforms=None):
 
         try:
             from scipy.io import loadmat
@@ -62,22 +63,25 @@ class SBDataset(VisionDataset):
             raise RuntimeError("Scipy is not found. This dataset needs to have scipy installed: "
                                "pip install scipy")
 
-        super(SBDataset, self).__init__(root)
+        super(SBDataset, self).__init__(root, transforms)
 
         if mode not in ("segmentation", "boundaries"):
             raise ValueError("Argument mode should be 'segmentation' or 'boundaries'")
 
-        self.xy_transform = xy_transform
         self.image_set = image_set
         self.mode = mode
         self.num_classes = 20
 
-        sbd_root = os.path.join(self.root, "benchmark_RELEASE", "dataset")
+        sbd_root = self.root
         image_dir = os.path.join(sbd_root, 'img')
         mask_dir = os.path.join(sbd_root, 'cls')
 
         if download:
             download_extract(self.url, self.root, self.filename, self.md5)
+            extracted_ds_root = os.path.join(self.root, "benchmark_RELEASE", "dataset")
+            for f in ["cls", "img", "inst", "train.txt", "val.txt"]:
+                old_path = os.path.join(extracted_ds_root, f)
+                shutil.move(old_path, sbd_root)
             download_url(self.voc_train_url, sbd_root, self.voc_split_filename,
                          self.voc_split_md5)
 
@@ -115,8 +119,8 @@ class SBDataset(VisionDataset):
         img = Image.open(self.images[index]).convert('RGB')
         target = self._get_target(self.masks[index])
 
-        if self.xy_transform is not None:
-            img, target = self.xy_transform(img, target)
+        if self.transforms is not None:
+            img, target = self.transforms(img, target)
 
         return img, target
 
